@@ -1,15 +1,10 @@
-import os, sys
+import os
 import numpy as np
 import imageio
-import json
-import random
 import time
 import paddle
-import paddle.nn as nn
 import paddle.nn.functional as F
-from tqdm import tqdm, trange
-
-import matplotlib.pyplot as plt
+from tqdm import tqdm
 
 from run_nerf_helpers import *
 
@@ -23,6 +18,8 @@ else:
     paddle.device.set_device("cpu")
 np.random.seed(0)
 DEBUG = False
+
+from visualdl import LogWriter
 
 
 def batchify(fn, chunk):
@@ -135,7 +132,7 @@ def render(H, W, K, chunk=1024*32, rays=None, c2w=None, ndc=True,
     return ret_list + [ret_dict]
 
 
-def render_path(render_poses, hwf, K, chunk, render_kwargs, gt_imgs=None, savedir=None, render_factor=0):
+def render_path(render_poses, hwf, K, chunk, render_kwargs, gt_imgs=None, savedir=None, render_factor=0, writer=None):
 
     H, W, focal = hwf
 
@@ -147,6 +144,7 @@ def render_path(render_poses, hwf, K, chunk, render_kwargs, gt_imgs=None, savedi
 
     rgbs = []
     disps = []
+    one_sence_psnr = []
 
     t = time.time()
     for i, c2w in enumerate(tqdm(render_poses)):
@@ -157,23 +155,26 @@ def render_path(render_poses, hwf, K, chunk, render_kwargs, gt_imgs=None, savedi
         disps.append(disp.cpu().numpy())
         if i==0:
             print(rgb.shape, disp.shape)
-
-        """
+      
         if gt_imgs is not None and render_factor==0:
             p = -10. * np.log10(np.mean(np.square(rgb.cpu().numpy() - gt_imgs[i])))
-            print(p)
-        """
-
+            one_sence_psnr.append(p)
+        
         if savedir is not None:
             rgb8 = to8b(rgbs[-1])
             filename = os.path.join(savedir, '{:03d}.png'.format(i))
             imageio.imwrite(filename, rgb8)
-
+    if len(one_sence_psnr)!=0:
+        one_sence_psnr = np.array(one_sence_psnr)
+        val_psnr = np.mean(one_sence_psnr)
+        print('this scence val PSNR:{}'.format(val_psnr))
+    else:
+        val_psnr = None
 
     rgbs = np.stack(rgbs, 0)
     disps = np.stack(disps, 0)
 
-    return rgbs, disps
+    return rgbs, disps, val_psnr
 
 
 def create_nerf(args):
@@ -205,10 +206,7 @@ def create_nerf(args):
                                                                 netchunk=args.netchunk)
 
     # Create optimizer
-    optimizer = paddle.optimizer.AdamW(
-        learning_rate=args.lrate,
-        parameters=grad_vars
-    )
+    optimizer = paddle.optimizer.Adam(parameters=grad_vars, learning_rate=args.lrate, beta1=0.9, beta2=0.999, epsilon=1e-07)
     # optimizer = torch.optim.AdamW(params=grad_vars, lr=args.lrate, betas=(0.9, 0.999))
 
     start = 0
@@ -526,7 +524,7 @@ def config_parser():
                         help='frequency of console printout and metric loggin')
     parser.add_argument("--i_img",     type=int, default=500, 
                         help='frequency of tensorboard image logging')
-    parser.add_argument("--i_weights", type=int, default=10000, 
+    parser.add_argument("--i_weights", type=int, default=50000, 
                         help='frequency of weight ckpt saving')
     parser.add_argument("--i_testset", type=int, default=50000, 
                         help='frequency of testset saving')
@@ -611,7 +609,7 @@ def train():
         ])
 
     if args.render_test:
-        render_poses = np.array(poses[i_test])
+        render_poses = np.array(poses[i_val])
 
     # Create log dir and copy the config file
     basedir = args.basedir
@@ -647,7 +645,7 @@ def train():
         with paddle.no_grad():
             if args.render_test:
                 # render_test switches to test poses
-                images = images[i_test]
+                images = images[i_val]
             else:
                 # Default is smoother render_poses path
                 images = None
@@ -656,7 +654,7 @@ def train():
             os.makedirs(testsavedir, exist_ok=True)
             print('test poses shape', render_poses.shape)
 
-            rgbs, _ = render_path(render_poses, hwf, K, args.chunk, render_kwargs_test, gt_imgs=images, savedir=testsavedir, render_factor=args.render_factor)
+            rgbs, _, _ = render_path(render_poses, hwf, K, args.chunk, render_kwargs_test, gt_imgs=images, savedir=testsavedir, render_factor=args.render_factor)
             print('Done rendering', testsavedir)
             imageio.mimwrite(os.path.join(testsavedir, 'video.mp4'), to8b(rgbs), fps=30, quality=8)
 
@@ -689,7 +687,7 @@ def train():
         rays_rgb = paddle.to_tensor(rays_rgb)
 
 
-    N_iters = 200000 + 1
+    N_iters = 1000000 + 1
     print('Begin')
     print('TRAIN views are', i_train)
     print('TEST views are', i_test)
@@ -699,128 +697,137 @@ def train():
     # writer = SummaryWriter(os.path.join(basedir, 'summaries', expname))
     
     start = start + 1
-    for i in trange(start, N_iters):
-        time0 = time.time()
 
-        # Sample random ray batch
-        if use_batching:
-            # Random over all images
-            batch = rays_rgb[i_batch:i_batch+N_rand] # [B, 2+1, 3*?]
-            # batch = paddle.transpose(batch, [1, 0, 3, 4])
-            batch = paddle_trans(batch, 0, 1)
-            batch_rays, target_s = batch[:2], batch[2]
+    log_dir = os.path.join(basedir, 'summaries')
+    with LogWriter(logdir=log_dir) as writer:
 
-            i_batch += N_rand
-            if i_batch >= rays_rgb.shape[0]:
-                print("Shuffle data after an epoch!")
-                rand_idx = paddle.randperm(rays_rgb.shape[0])
-                rays_rgb = rays_rgb[rand_idx]
-                i_batch = 0
+        for i in range(start, N_iters):
+            time0 = time.time()
 
-        else:
-            # Random from one image
-            img_i = np.random.choice(i_train)
-            target = images[img_i]
-            target = paddle.to_tensor(target)
-            pose = poses[img_i, :3,:4]
+            # Sample random ray batch
+            if use_batching:
+                # Random over all images
+                batch = rays_rgb[i_batch:i_batch+N_rand] # [B, 2+1, 3*?]
+                # batch = paddle.transpose(batch, [1, 0, 3, 4])
+                batch = paddle_trans(batch, 0, 1)
+                batch_rays, target_s = batch[:2], batch[2]
 
-            if N_rand is not None:
-                rays_o, rays_d = get_rays(H, W, K, paddle.to_tensor(pose))  # (H, W, 3), (H, W, 3)
+                i_batch += N_rand
+                if i_batch >= rays_rgb.shape[0]:
+                    print("Shuffle data after an epoch!")
+                    rand_idx = paddle.randperm(rays_rgb.shape[0])
+                    rays_rgb = rays_rgb[rand_idx]
+                    i_batch = 0
 
-                if i < args.precrop_iters:
-                    dH = int(H//2 * args.precrop_frac)
-                    dW = int(W//2 * args.precrop_frac)
-                    coords = paddle.stack(
-                        paddle.meshgrid(
-                            paddle.linspace(H//2 - dH, H//2 + dH - 1, 2*dH), 
-                            paddle.linspace(W//2 - dW, W//2 + dW - 1, 2*dW)
-                        ), axis=-1)
-                    if i == start:
-                        print(f"[Config] Center cropping of size {2*dH} x {2*dW} is enabled until iter {args.precrop_iters}")                
-                else:
-                    coords = paddle.stack(paddle.meshgrid(paddle.linspace(0, H-1, H), paddle.linspace(0, W-1, W)), -1)  # (H, W, 2)
+            else:
+                # Random from one image
+                img_i = np.random.choice(i_train)
+                target = images[img_i]
+                target = paddle.to_tensor(target)
+                pose = poses[img_i, :3,:4]
 
-                coords = paddle.reshape(coords, [-1,2])  # (H * W, 2)
-                select_inds = np.random.choice(coords.shape[0], size=[N_rand], replace=False)  # (N_rand,)
-                select_coords = coords[select_inds].astype('int64')  # (N_rand, 2)
-                rays_o = rays_o[select_coords[:, 0], select_coords[:, 1]]  # (N_rand, 3)
-                rays_d = rays_d[select_coords[:, 0], select_coords[:, 1]]  # (N_rand, 3)
-                batch_rays = paddle.stack([rays_o, rays_d], axis=0)
-                target_s = target[select_coords[:, 0], select_coords[:, 1]]  # (N_rand, 3)
+                if N_rand is not None:
+                    rays_o, rays_d = get_rays(H, W, K, paddle.to_tensor(pose))  # (H, W, 3), (H, W, 3)
 
-        #####  Core optimization loop  #####
-        rgb, disp, acc, extras = render(H, W, K, chunk=args.chunk, rays=batch_rays,
-                                                verbose=i < 10, retraw=True,
-                                                **render_kwargs_train)
+                    if i < args.precrop_iters:
+                        dH = int(H//2 * args.precrop_frac)
+                        dW = int(W//2 * args.precrop_frac)
+                        coords = paddle.stack(
+                            paddle.meshgrid(
+                                paddle.linspace(H//2 - dH, H//2 + dH - 1, 2*dH), 
+                                paddle.linspace(W//2 - dW, W//2 + dW - 1, 2*dW)
+                            ), axis=-1)
+                        if i == start:
+                            print(f"[Config] Center cropping of size {2*dH} x {2*dW} is enabled until iter {args.precrop_iters}")                
+                    else:
+                        coords = paddle.stack(paddle.meshgrid(paddle.linspace(0, H-1, H), paddle.linspace(0, W-1, W)), -1)  # (H, W, 2)
 
-        optimizer.clear_grad()
-        img_loss = img2mse(rgb, target_s)
-        trans = extras['raw'][...,-1]
-        loss = img_loss
-        psnr = mse2psnr(img_loss)
+                    coords = paddle.reshape(coords, [-1,2])  # (H * W, 2)
+                    select_inds = np.random.choice(coords.shape[0], size=[N_rand], replace=False)  # (N_rand,)
+                    select_coords = coords[select_inds].astype('int64')  # (N_rand, 2)
+                    rays_o = rays_o[select_coords[:, 0], select_coords[:, 1]]  # (N_rand, 3)
+                    rays_d = rays_d[select_coords[:, 0], select_coords[:, 1]]  # (N_rand, 3)
+                    batch_rays = paddle.stack([rays_o, rays_d], axis=0)
+                    target_s = target[select_coords[:, 0], select_coords[:, 1]]  # (N_rand, 3)
 
-        if 'rgb0' in extras:
-            img_loss0 = img2mse(extras['rgb0'], target_s)
-            loss = loss + img_loss0
-            psnr0 = mse2psnr(img_loss0)
+            #####  Core optimization loop  #####
+            rgb, disp, acc, extras = render(H, W, K, chunk=args.chunk, rays=batch_rays,
+                                                    verbose=i < 10, retraw=True,
+                                                    **render_kwargs_train)
 
-        loss.backward()
-        optimizer.step()
+            optimizer.clear_grad()
+            img_loss = img2mse(rgb, target_s)
+            trans = extras['raw'][...,-1]
+            loss = img_loss
+            psnr = mse2psnr(img_loss)
 
-        # NOTE: IMPORTANT!
-        ###   update learning rate   ###
-        decay_rate = 0.1
-        decay_steps = args.lrate_decay * 1000
-        new_lrate = args.lrate * (decay_rate ** (global_step / decay_steps))
+            writer.add_scalar(tag='loss', value=loss.item(), step=global_step)
+            writer.add_scalar(tag='lr', value=optimizer.get_lr(), step=global_step)
 
-        optimizer._learning_rate = new_lrate
-        ################################
+            if 'rgb0' in extras:
+                img_loss0 = img2mse(extras['rgb0'], target_s)
+                loss = loss + img_loss0
+                psnr0 = mse2psnr(img_loss0)
 
-        dt = time.time()-time0
-        # print(f"Step: {global_step}, Loss: {loss}, Time: {dt}")
-        #####           end            #####
+            loss.backward()
+            optimizer.step()
 
-        # Rest is logging
-        if i%args.i_weights==0:
-            path = os.path.join(basedir, expname, '{:06d}.pdparams'.format(i))
-            paddle.save({
-                'global_step': global_step,
-                'network_fn_state_dict': render_kwargs_train['network_fn'].state_dict(),
-                'network_fine_state_dict': render_kwargs_train['network_fine'].state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-            }, path)
-            print('Saved checkpoints at', path)
+            # NOTE: IMPORTANT!
+            ###   update learning rate   ###
+            decay_rate = 0.1
+            decay_steps = args.lrate_decay * 1000
+            new_lrate = args.lrate * (decay_rate ** (global_step / decay_steps))
 
-        if i%args.i_video==0 and i > 0:
-            # Turn on testing mode
-            with paddle.no_grad():
-                rgbs, disps = render_path(render_poses, hwf, K, args.chunk, render_kwargs_test)
-            print('Done, saving', rgbs.shape, disps.shape)
-            moviebase = os.path.join(basedir, expname, '{}_spiral_{:06d}_'.format(expname, i))
-            imageio.mimwrite(moviebase + 'rgb.mp4', to8b(rgbs), fps=30, quality=8)
-            imageio.mimwrite(moviebase + 'disp.mp4', to8b(disps / np.max(disps)), fps=30, quality=8)
+            optimizer.set_lr(new_lrate)
+            ################################
 
-            # if args.use_viewdirs:
-            #     render_kwargs_test['c2w_staticcam'] = render_poses[0][:3,:4]
-            #     with torch.no_grad():
-            #         rgbs_still, _ = render_path(render_poses, hwf, args.chunk, render_kwargs_test)
-            #     render_kwargs_test['c2w_staticcam'] = None
-            #     imageio.mimwrite(moviebase + 'rgb_still.mp4', to8b(rgbs_still), fps=30, quality=8)
+            dt = time.time()-time0
+            # print(f"Step: {global_step}, Loss: {loss}, Time: {dt}")
+            #####           end            #####
 
-        if i%args.i_testset==0 and i > 0:
-            testsavedir = os.path.join(basedir, expname, 'testset_{:06d}'.format(i))
-            os.makedirs(testsavedir, exist_ok=True)
-            print('test poses shape', poses[i_test].shape)
-            with paddle.no_grad():
-                render_path(paddle.to_tensor(poses[i_test]), hwf, K, args.chunk, render_kwargs_test, gt_imgs=images[i_test], savedir=testsavedir)
-            print('Saved test set')
+            # Rest is logging
+            if i%args.i_weights==0:
+                path = os.path.join(basedir, expname, '{:06d}.pdparams'.format(i))
+                paddle.save({
+                    'global_step': global_step,
+                    'network_fn_state_dict': render_kwargs_train['network_fn'].state_dict(),
+                    'network_fine_state_dict': render_kwargs_train['network_fine'].state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                }, path)
+                print('Saved checkpoints at', path)
+
+            if i%args.i_video==0 and i > 0:
+                # Turn on testing mode
+                with paddle.no_grad():
+                    rgbs, disps, _ = render_path(render_poses, hwf, K, args.chunk, render_kwargs_test)
+                print('Done, saving', rgbs.shape, disps.shape)
+                moviebase = os.path.join(basedir, expname, '{}_spiral_{:06d}_'.format(expname, i))
+                imageio.mimwrite(moviebase + 'rgb.mp4', to8b(rgbs), fps=30, quality=8)
+                imageio.mimwrite(moviebase + 'disp.mp4', to8b(disps / np.max(disps)), fps=30, quality=8)
+
+                # if args.use_viewdirs:
+                #     render_kwargs_test['c2w_staticcam'] = render_poses[0][:3,:4]
+                #     with torch.no_grad():
+                #         rgbs_still, _, _ = render_path(render_poses, hwf, args.chunk, render_kwargs_test)
+                #     render_kwargs_test['c2w_staticcam'] = None
+                #     imageio.mimwrite(moviebase + 'rgb_still.mp4', to8b(rgbs_still), fps=30, quality=8)
+
+            if i%args.i_testset==0 and i > 0:
+                testsavedir = os.path.join(basedir, expname, 'testset_{:06d}'.format(i))
+                os.makedirs(testsavedir, exist_ok=True)
+                print('test poses shape', poses[i_val].shape)
+                with paddle.no_grad():
+                    _, _, val_psnr =render_path(paddle.to_tensor(poses[i_val]), hwf, K, args.chunk, render_kwargs_test, gt_imgs=images[i_val], savedir=testsavedir)
+                
+                writer.add_scalar(tag='PSNR_val', value=val_psnr, step=global_step)
+                print('Saved test set, ')
 
 
-    
-        if i%args.i_print==0:
-            tqdm.write(f"[TRAIN] Iter: {i} Loss: {loss.item()}  PSNR: {psnr.item()}")
+        
+            if i%args.i_print==0:
+                print(f"[TRAIN] Iter: {i} Loss: {loss.item()}  PSNR: {psnr.item()}")
 
-        global_step += 1
+            global_step += 1
 
 
 if __name__=='__main__':
